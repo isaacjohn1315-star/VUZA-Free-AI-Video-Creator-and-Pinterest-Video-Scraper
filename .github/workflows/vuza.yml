@@ -1,0 +1,96 @@
+name: Start VUZA
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  run-vuza:
+    runs-on: ubuntu-latest
+    timeout-minutes: 350
+
+    steps:
+      - name: Check out VUZA
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+          pip install pyngrok
+          python -m playwright install --with-deps chromium
+
+      - name: Start VUZA server
+        run: |
+          nohup python -u app.py > /tmp/vuza.log 2>&1 &
+          echo $! > /tmp/vuza.pid
+
+          for i in $(seq 1 60); do
+            if ! kill -0 "$(cat /tmp/vuza.pid)" 2>/dev/null; then
+              echo "VUZA exited during startup."
+              cat /tmp/vuza.log
+              exit 1
+            fi
+
+            if curl --silent --fail http://127.0.0.1:8000/ >/dev/null; then
+              echo "VUZA is responding on port 8000."
+              exit 0
+            fi
+
+            sleep 2
+          done
+
+          echo "VUZA did not respond on port 8000."
+          cat /tmp/vuza.log
+          exit 1
+
+      - name: Open secure ngrok tunnel
+        env:
+          NGROK_AUTHTOKEN: ${{ secrets.NGROK_AUTHTOKEN }}
+        run: |
+          if [ -z "$NGROK_AUTHTOKEN" ]; then
+            echo "Missing NGROK_AUTHTOKEN repository secret."
+            exit 1
+          fi
+
+          python -u - <<'PY'
+          import os
+          import time
+          import subprocess
+          from pyngrok import ngrok
+
+          pid = int(open("/tmp/vuza.pid").read().strip())
+
+          ngrok.set_auth_token(os.environ["NGROK_AUTHTOKEN"])
+          tunnel = ngrok.connect(addr=8000, proto="http")
+
+          print("\n" + "=" * 50, flush=True)
+          print("VUZA IS RUNNING", flush=True)
+          print("PUBLIC URL: " + tunnel.public_url, flush=True)
+          print("Keep this GitHub Actions run active.", flush=True)
+          print("=" * 50 + "\n", flush=True)
+
+          try:
+              while True:
+                  result = subprocess.run(
+                      ["kill", "-0", str(pid)],
+                      capture_output=True
+                  )
+                  if result.returncode != 0:
+                      print("VUZA process stopped. Server log:", flush=True)
+                      print(
+                          open("/tmp/vuza.log").read()[-12000:],
+                          flush=True
+                      )
+                      raise SystemExit(1)
+                  time.sleep(15)
+          finally:
+              ngrok.kill()
+          PY
